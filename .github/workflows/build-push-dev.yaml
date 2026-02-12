@@ -1,0 +1,153 @@
+name: Build, Push and Promote (dev)
+
+on:
+  push:
+    branches: ["development"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: dev-build-push
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: project-c5f72c1b-6454-456f-bc4
+  GAR_LOCATION: europe-west1
+  GAR_REPOSITORY: duman-platform
+  SERVICE_NAME: gke-be-test-1
+
+  WORKLOAD_IDENTITY_PROVIDER: projects/9788881395/locations/global/workloadIdentityPools/github-pool-1/providers/github-provider-1
+  SERVICE_ACCOUNT: gke-test@project-c5f72c1b-6454-456f-bc4.iam.gserviceaccount.com
+
+  GITOPS_REPO: AgentCarter1/duman-platform-gitops
+  GITOPS_BRANCH: main
+  GITOPS_OVERLAY_DIR: apps/gke-be-test-1/overlays/development
+  IMAGE_NAME: europe-west1-docker.pkg.dev/project-c5f72c1b-6454-456f-bc4/duman-platform/dev/gke-be-test-1
+
+jobs:
+  build-push-and-promote:
+    environment: Deployment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout backend repo
+        uses: actions/checkout@v4
+
+      - name: Debug env
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "PROJECT_ID=$PROJECT_ID"
+          echo "GAR_LOCATION=$GAR_LOCATION"
+          echo "GAR_REPOSITORY=$GAR_REPOSITORY"
+          echo "SERVICE_NAME=$SERVICE_NAME"
+          echo "IMAGE_NAME=$IMAGE_NAME"
+          echo "GITOPS_REPO=$GITOPS_REPO"
+          echo "GITOPS_BRANCH=$GITOPS_BRANCH"
+          echo "GITOPS_OVERLAY_DIR=$GITOPS_OVERLAY_DIR"
+
+      - id: auth
+        name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Docker login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GAR_LOCATION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.auth_token }}
+
+      - name: Build & Push image (tag = SHA)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          IMAGE="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}/dev/${SERVICE_NAME}"
+          TAG="${IMAGE}:${GITHUB_SHA}"
+
+          docker version
+          docker build -t "${TAG}" .
+          docker push "${TAG}"
+
+          echo "Pushed: ${TAG}"
+
+      # ---- GitOps repo update (Kustomize newTag) ----
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: ${{ env.GITOPS_BRANCH }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update image tag in GitOps kustomization
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          FILE="gitops/${GITOPS_OVERLAY_DIR}/kustomization.yaml"
+          test -f "$FILE"
+          echo "Before:"
+          cat "$FILE"
+
+          python3 - <<'PY'
+          import os, re
+          path = os.environ["FILE"]
+          image = os.environ["IMAGE_NAME"]
+          new_tag = os.environ["GITHUB_SHA"]
+
+          with open(path, "r", encoding="utf-8") as f:
+            s = f.read()
+
+          # images:
+          # - name: <IMAGE_NAME>
+          #   newTag: <...>
+          #
+          # name bloğunu bulup newTag'i değiştiriyoruz
+          pattern = re.compile(
+            r"(name:\s*" + re.escape(image) + r"\s*\n\s*newTag:\s*)([^\s]+)",
+            re.MULTILINE
+          )
+          if not pattern.search(s):
+            raise SystemExit(f"Could not find image block for: {image} in {path}")
+
+          s2 = pattern.sub(r"\g<1>" + new_tag, s)
+
+          with open(path, "w", encoding="utf-8") as f:
+            f.write(s2)
+
+          print("Updated newTag ->", new_tag)
+          PY
+
+          echo "After:"
+          cat "$FILE"
+        env:
+          FILE: gitops/${{ env.GITOPS_OVERLAY_DIR }}/kustomization.yaml
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          GITHUB_SHA: ${{ github.sha }}
+
+      - name: Commit & Push GitOps change
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd gitops
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git status
+          git add "${GITOPS_OVERLAY_DIR}/kustomization.yaml"
+
+          # Değişiklik yoksa boş commit atmasın
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "dev: ${SERVICE_NAME} -> ${GITHUB_SHA}"
+          git push origin "${GITOPS_BRANCH}"
