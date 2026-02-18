@@ -3,6 +3,6 @@ import { Injectable } from '@nestjs/common';
 @Injectable()
 export class AppService {
   getHello(): string {
-    return `${process.env.PORT} Guncellendi YAML` ;
+    return `${process.env.PORT} Guncellendi YAML GTIOPS` ;
   }
 }
