@@ -18,7 +18,7 @@ env:
   GITOPS_REPO: AgentCarter1/duman-platform-gitops
   GITOPS_BRANCH: main
   GITOPS_OVERLAY_DIR: apps/gke-be-test-1/overlays/development
-  IMAGE_NAME: europe-west1-docker.pkg.dev/project-c5f72c1b-6454-456f-bc4/duman-platform/dev/gke-be-test-1
+  COMMIT_PREFIX: ${{ vars.COMMIT_PREFIX || 'dev' }}
 
 jobs:
   build-push:
@@ -45,12 +45,15 @@ jobs:
           password: ${{ steps.auth.outputs.access_token }}
 
       - name: Build & Push image
+        id: build
         run: |
           set -euxo pipefail
           IMAGE="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}/dev/${SERVICE_NAME}"
           TAG="${IMAGE}:${GITHUB_SHA}"
           docker build -t "${TAG}" .
           docker push "${TAG}"
+          echo "IMAGE_NAME=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_OUTPUT
 
       - name: Checkout GitOps repo
         uses: actions/checkout@v4
@@ -60,33 +63,22 @@ jobs:
           token: ${{ secrets.GITOPS_TOKEN }}
           path: gitops
 
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
       - name: Update image tag in GitOps kustomization
         shell: bash
         run: |
           set -euxo pipefail
           FILE="gitops/${GITOPS_OVERLAY_DIR}/kustomization.yaml"
           test -f "$FILE"
-          python3 - <<'PY'
-          import os, re
-          path = os.environ["FILE"]
-          image = os.environ["IMAGE_NAME"]
-          new_tag = os.environ["NEW_TAG"]
-          with open(path, "r", encoding="utf-8") as f:
-            s = f.read()
-          pattern = re.compile(
-            r"(name:\s*" + re.escape(image) + r"\s*\n\s*newTag:\s*)([^\s]+)",
-            re.MULTILINE
-          )
-          if not pattern.search(s):
-            raise SystemExit(f"Could not find image block for: {image} in {path}")
-          s2 = pattern.sub(r"\g<1>" + new_tag, s)
-          with open(path, "w", encoding="utf-8") as f:
-            f.write(s2)
-          print("Updated newTag ->", new_tag)
-          PY
+          yq eval ".images[] |= select(.name == \"${IMAGE_NAME}\") |= .newTag = \"${NEW_TAG}\"" -i "$FILE"
+          echo "Updated newTag -> ${NEW_TAG}"
         env:
-          FILE: gitops/${{ env.GITOPS_OVERLAY_DIR }}/kustomization.yaml
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ steps.build.outputs.IMAGE_NAME }}
           NEW_TAG: ${{ github.sha }}
 
       - name: Commit & Push GitOps change
@@ -101,5 +93,7 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "dev: ${SERVICE_NAME} -> ${GITHUB_SHA}"
+          git commit -m "${COMMIT_PREFIX}: ${SERVICE_NAME} -> ${GITHUB_SHA}"
           git push origin "${GITOPS_BRANCH}"
+        env:
+          COMMIT_PREFIX: ${{ env.COMMIT_PREFIX }}
