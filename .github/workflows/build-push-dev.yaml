@@ -13,11 +13,8 @@ env:
   GAR_LOCATION: europe-west1
   GAR_REPOSITORY: duman-platform
   SERVICE_NAME: gke-be-test-1
-
   WORKLOAD_IDENTITY_PROVIDER: projects/9788881395/locations/global/workloadIdentityPools/github-pool-1/providers/github-provider-1
   SERVICE_ACCOUNT: gke-test@project-c5f72c1b-6454-456f-bc4.iam.gserviceaccount.com
-
-  # GitOps config
   GITOPS_REPO: AgentCarter1/duman-platform-gitops
   GITOPS_BRANCH: main
   GITOPS_OVERLAY_DIR: apps/gke-be-test-1/overlays/development
@@ -29,38 +26,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
-      - id: auth
-        name: Authenticate to Google Cloud (WIF)
+      - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.SERVICE_ACCOUNT }}
           token_format: access_token
-
-      # DEBUG 1: Hangi SA ile authenticate oluyoruz?
-      - name: Debug - show auth context
-        run: |
-          echo "PROJECT_ID=${PROJECT_ID}"
-          echo "GAR_LOCATION=${GAR_LOCATION}"
-          echo "GAR_REPOSITORY=${GAR_REPOSITORY}"
-          echo "SERVICE_NAME=${SERVICE_NAME}"
-          echo "SERVICE_ACCOUNT=${SERVICE_ACCOUNT}"
-          echo "WIF_PROVIDER=${WORKLOAD_IDENTITY_PROVIDER}"
-          echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}"
-          echo "GITHUB_SHA=${GITHUB_SHA}"
-
-      # (Opsiyonel ama faydalı) gcloud kurup token'ı doğrulamak istersen:
-      - name: Setup gcloud (debug helper)
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Debug - gcloud auth check
-        run: |
-          gcloud --version
-          gcloud auth list || true
-          gcloud config list || true
-          echo "Access token length: $(echo -n '${{ steps.auth.outputs.access_token }}' | wc -c)"
 
       - name: Docker login to Artifact Registry
         uses: docker/login-action@v3
@@ -69,29 +44,14 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      # DEBUG 2: Docker login gerçekten oldu mu?
-      - name: Debug - docker info
-        run: |
-          docker version
-          docker info | head -n 50
-
-      - name: Build & Push image (tag = SHA)
+      - name: Build & Push image
         run: |
           set -euxo pipefail
           IMAGE="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}/dev/${SERVICE_NAME}"
           TAG="${IMAGE}:${GITHUB_SHA}"
-
-          echo "Will push image:"
-          echo "${TAG}"
-
           docker build -t "${TAG}" .
           docker push "${TAG}"
 
-          echo "Pushed: ${TAG}"
-
-      # ---------------------------
-      # GitOps repo update (newTag)
-      # ---------------------------
       - name: Checkout GitOps repo
         uses: actions/checkout@v4
         with:
@@ -104,38 +64,24 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           FILE="gitops/${GITOPS_OVERLAY_DIR}/kustomization.yaml"
           test -f "$FILE"
-
-          echo "Before:"
-          cat "$FILE"
-
           python3 - <<'PY'
           import os, re
           path = os.environ["FILE"]
           image = os.environ["IMAGE_NAME"]
           new_tag = os.environ["NEW_TAG"]
-
           with open(path, "r", encoding="utf-8") as f:
             s = f.read()
-
-          # images:
-          # - name: <IMAGE_NAME>
-          #   newTag: <...>
           pattern = re.compile(
             r"(name:\s*" + re.escape(image) + r"\s*\n\s*newTag:\s*)([^\s]+)",
             re.MULTILINE
           )
-
           if not pattern.search(s):
             raise SystemExit(f"Could not find image block for: {image} in {path}")
-
           s2 = pattern.sub(r"\g<1>" + new_tag, s)
-
           with open(path, "w", encoding="utf-8") as f:
             f.write(s2)
-
           print("Updated newTag ->", new_tag)
           PY
         env:
@@ -148,16 +94,12 @@ jobs:
         run: |
           set -euxo pipefail
           cd gitops
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add "${GITOPS_OVERLAY_DIR}/kustomization.yaml"
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-
           git commit -m "dev: ${SERVICE_NAME} -> ${GITHUB_SHA}"
           git push origin "${GITOPS_BRANCH}"
